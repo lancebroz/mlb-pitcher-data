@@ -100,7 +100,6 @@ def main():
     agg_path.mkdir(parents=True, exist_ok=True)
     
     # Determine date range to fetch
-    # Check last update
     tracker_file = base_path / 'last_update.json'
     if tracker_file.exists():
         with open(tracker_file) as f:
@@ -129,9 +128,6 @@ def main():
         current_date += timedelta(days=1)
     
     if all_pitches:
-        # Save to parquet by month
-        df_new = pa.Table.from_pylist(all_pitches)
-        
         # Group by month and save
         for month in set(p['game_date'][:7] for p in all_pitches):
             month_num = int(month.split('-')[1])
@@ -140,40 +136,74 @@ def main():
             
             month_pitches = [p for p in all_pitches if p['game_date'].startswith(month)]
             
-            # Load existing if present
+            # Load existing if present and merge
             if month_file.exists():
-                existing = pq.read_table(month_file).to_pylist()
-                # Merge avoiding duplicates (by game_date + pitcher_id + batter_id + count index)
-                existing_keys = set((p['game_date'], p['pitcher_id'], p['batter_id'], p.get('count', '')) for p in existing)
-                for p in month_pitches:
-                    key = (p['game_date'], p['pitcher_id'], p['batter_id'], p.get('count', ''))
-                    if key not in existing_keys:
-                        existing.append(p)
-                month_pitches = existing
+                try:
+                    existing_table = pq.read_table(month_file)
+                    existing = existing_table.to_pylist()
+                    # Only merge if schema matches
+                    if existing and 'stand' in existing[0]:
+                        existing_keys = set()
+                        for i, p in enumerate(existing):
+                            key = (p.get('game_date', ''), p.get('pitcher_id', ''), i)
+                            existing_keys.add(key)
+                        month_pitches = existing + month_pitches
+                except Exception as e:
+                    print(f"  Warning: Could not read existing {month_file}: {e}")
+                    # Will overwrite with new data
             
             pq.write_table(pa.Table.from_pylist(month_pitches), month_file)
             print(f"Saved {len(month_pitches)} pitches to {month_file}")
     
-    # Now aggregate all data
+    # Now aggregate all data from parquet files
     print("\nAggregating data...")
     
     all_data = []
     for parquet_file in raw_path.glob('*.parquet'):
-        table = pq.read_table(parquet_file)
-        all_data.extend(table.to_pylist())
+        try:
+            table = pq.read_table(parquet_file)
+            rows = table.to_pylist()
+            # Check if data has required columns
+            if rows and 'stand' in rows[0] and 'pitch_type' in rows[0]:
+                all_data.extend(rows)
+            else:
+                print(f"  Skipping {parquet_file} - missing required columns")
+        except Exception as e:
+            print(f"  Error reading {parquet_file}: {e}")
     
     print(f"Total pitches: {len(all_data)}")
     
+    if not all_data:
+        print("No valid data to aggregate. Exiting.")
+        # Still save empty output so the file exists
+        output = {
+            'season': SEASON,
+            'last_updated': datetime.now().isoformat(),
+            'total_pitches': 0,
+            'total_pitchers': 0,
+            'data': {},
+            'monthly': {}
+        }
+        output_file = agg_path / 'pitch_usage_by_count.json'
+        with open(output_file, 'w') as f:
+            json.dump(output, f)
+        return
+    
     # Build aggregations
-    season_data = {}  # pitcher -> stand -> pitch_type -> count -> total
-    monthly_data = {}  # month -> pitcher -> stand -> pitch_type -> count -> total
+    season_data = {}
+    monthly_data = {}
     
     for pitch in all_data:
-        pitcher = pitch['pitcher_name']
-        stand = pitch['stand']
-        pitch_type = pitch['pitch_type']
-        count = pitch['count']
-        month_num = int(pitch['game_date'].split('-')[1])
+        pitcher = pitch.get('pitcher_name', '')
+        stand = pitch.get('stand', '')
+        pitch_type = pitch.get('pitch_type', '')
+        count = pitch.get('count', '')
+        game_date = pitch.get('game_date', '')
+        
+        if not all([pitcher, stand, pitch_type, count, game_date]):
+            continue
+            
+        month_num = int(game_date.split('-')[1])
         month_name = MONTH_NAMES.get(month_num, f'Month{month_num}')
         
         # Season aggregation
@@ -205,10 +235,8 @@ def main():
                     total += count_val
         return total
     
-    # Season qualified
     qualified_season = {p: d for p, d in season_data.items() if count_pitches(d) >= MIN_PITCHES_SEASON}
     
-    # Monthly qualified
     qualified_monthly = {}
     for month, pitchers in monthly_data.items():
         qualified_monthly[month] = {p: d for p, d in pitchers.items() if count_pitches(d) >= MIN_PITCHES_MONTH}
