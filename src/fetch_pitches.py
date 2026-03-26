@@ -1,449 +1,240 @@
+#!/usr/bin/env python3
 """
-MLB Pitch Data Fetcher
-======================
-Fetches pitch-by-pitch data from the MLB Stats API live feed.
-Stores raw data in Parquet format, partitioned by month.
-Generates aggregated views for downstream apps.
-
-Schedule: Runs 6x daily via GitHub Actions
+Fetch MLB pitch data from the live feed API and aggregate for the pitch usage app.
+Runs via GitHub Actions on a schedule.
 """
 
-import requests
-import pandas as pd
 import json
-import os
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# === CONFIGURATION ===
+# Config
+MIN_PITCHES_SEASON = 10   # Lowered for early season
+MIN_PITCHES_MONTH = 10    # Lowered for early season
 SEASON = 2026
-DATA_DIR = Path(__file__).parent.parent / "data"
-RAW_DIR = DATA_DIR / "raw" / str(SEASON)
-AGG_DIR = DATA_DIR / "aggregated"
-TRACKER_FILE = DATA_DIR / "last_update.json"
 
-# MLB API endpoints
-SCHEDULE_URL = "https://statsapi.mlb.com/api/v1/schedule"
-LIVE_FEED_URL = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+# Valid counts only (filter out MLB API post-pitch count bug)
+VALID_COUNTS = {'0-0', '0-1', '0-2', '1-0', '1-1', '1-2', '2-0', '2-1', '2-2', '3-0', '3-1', '3-2'}
 
-# Pitch type mapping for readable names
-PITCH_NAMES = {
-    'FF': '4-Seam Fastball', 'SI': 'Sinker', 'FC': 'Cutter',
-    'SL': 'Slider', 'CU': 'Curveball', 'KC': 'Knuckle Curve',
-    'CH': 'Changeup', 'FS': 'Splitter', 'KN': 'Knuckleball',
-    'SC': 'Screwball', 'CS': 'Slow Curve', 'SV': 'Sweeper',
-    'ST': 'Sweeping Curve', 'FA': 'Fastball', 'EP': 'Eephus'
+MONTH_NAMES = {
+    3: 'March', 4: 'April', 5: 'May', 6: 'June',
+    7: 'July', 8: 'August', 9: 'September', 10: 'October', 11: 'November'
 }
 
-
-def get_last_update() -> Optional[str]:
-    """Get the last date we successfully processed."""
-    if TRACKER_FILE.exists():
-        with open(TRACKER_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get('last_date')
-    return None
-
-
-def save_last_update(date_str: str):
-    """Save the last successfully processed date."""
-    TRACKER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(TRACKER_FILE, 'w') as f:
-        json.dump({'last_date': date_str, 'updated_at': datetime.now().isoformat()}, f)
-
-
-def get_season_start(season: int) -> str:
-    """Get the regular season start date (approximate)."""
-    # 2026 regular season starts March 25
-    return f"{season}-03-25"
-
-
-def get_schedule(start_date: str, end_date: str) -> list:
-    """Fetch game IDs from the MLB schedule API."""
-    params = {
-        'sportId': 1,  # MLB
-        'startDate': start_date,
-        'endDate': end_date,
-        'gameType': 'R',  # Regular season only (excludes Spring Training)
-        'hydrate': 'team'
-    }
-    
-    try:
-        response = requests.get(SCHEDULE_URL, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as e:
-        print(f"Error fetching schedule: {e}")
-        return []
-    
+def get_schedule(date):
+    """Get game IDs for a given date."""
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
+    resp = requests.get(url)
     games = []
-    for date_entry in data.get('dates', []):
-        game_date = date_entry['date']
-        for game in date_entry.get('games', []):
-            # Only include completed games
-            if game.get('status', {}).get('abstractGameState') == 'Final':
-                games.append({
-                    'game_pk': game['gamePk'],
-                    'game_date': game_date,
-                    'home_team': game.get('teams', {}).get('home', {}).get('team', {}).get('abbreviation', ''),
-                    'away_team': game.get('teams', {}).get('away', {}).get('team', {}).get('abbreviation', ''),
-                    'venue': game.get('venue', {}).get('name', '')
-                })
-    
+    if resp.ok:
+        data = resp.json()
+        for date_entry in data.get('dates', []):
+            for game in date_entry.get('games', []):
+                if game.get('status', {}).get('abstractGameState') == 'Final':
+                    games.append(game['gamePk'])
     return games
 
-
-def extract_pitch_data(game_pk: int, game_info: dict) -> list:
-    """Extract all pitch data from a game's live feed."""
-    try:
-        response = requests.get(LIVE_FEED_URL.format(game_pk=game_pk), timeout=60)
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as e:
-        print(f"Error fetching game {game_pk}: {e}")
-        return []
-    
+def get_pitch_data(game_id):
+    """Get all pitches from a game."""
+    url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
+    resp = requests.get(url)
     pitches = []
     
-    # Get player lookup for names
-    players = data.get('gameData', {}).get('players', {})
+    if not resp.ok:
+        return pitches
+    
+    data = resp.json()
+    game_date = data.get('gameData', {}).get('datetime', {}).get('officialDate', '')
     
     all_plays = data.get('liveData', {}).get('plays', {}).get('allPlays', [])
     
     for play in all_plays:
-        # Get matchup info
-        matchup = play.get('matchup', {})
-        pitcher_id = matchup.get('pitcher', {}).get('id')
-        batter_id = matchup.get('batter', {}).get('id')
-        batter_hand = matchup.get('batSide', {}).get('code', '')
-        pitcher_hand = matchup.get('pitchHand', {}).get('code', '')
+        batter = play.get('matchup', {}).get('batter', {})
+        pitcher = play.get('matchup', {}).get('pitcher', {})
+        bat_side = play.get('matchup', {}).get('batSide', {}).get('code', '')
         
-        # Get pitcher/batter names from player lookup
-        pitcher_info = players.get(f'ID{pitcher_id}', {})
-        batter_info = players.get(f'ID{batter_id}', {})
-        pitcher_name = pitcher_info.get('fullName', '')
-        batter_name = batter_info.get('fullName', '')
-        
-        # Play context
-        about = play.get('about', {})
-        inning = about.get('inning', 0)
-        top_bottom = about.get('halfInning', '')  # 'top' or 'bottom'
-        at_bat_number = about.get('atBatIndex', 0)
-        
-        # Iterate through each pitch event
-        play_events = play.get('playEvents', [])
-        for event in play_events:
-            # Only process actual pitches (not pickoffs, etc.)
-            if not event.get('isPitch', False):
-                continue
-            
-            details = event.get('details', {})
-            pitch_data = event.get('pitchData', {})
-            count = event.get('count', {})
-            hit_data = event.get('hitData', {})
-            
-            # Build comprehensive pitch record
-            pitch_record = {
-                # === Game Context ===
-                'game_pk': game_pk,
-                'game_date': game_info['game_date'],
-                'home_team': game_info['home_team'],
-                'away_team': game_info['away_team'],
-                'venue': game_info['venue'],
-                'inning': inning,
-                'top_bottom': top_bottom,
-                'at_bat_number': at_bat_number,
-                'pitch_number': event.get('pitchNumber', 0),
+        for event in play.get('playEvents', []):
+            if event.get('isPitch', False):
+                details = event.get('details', {})
+                pitch_type = details.get('type', {}).get('code', '')
                 
-                # === Matchup ===
-                'pitcher_id': pitcher_id,
-                'pitcher_name': pitcher_name,
-                'pitcher_hand': pitcher_hand,
-                'batter_id': batter_id,
-                'batter_name': batter_name,
-                'batter_hand': batter_hand,
+                # Get the count BEFORE this pitch (pre-pitch count)
+                count = event.get('count', {})
+                balls = count.get('balls', 0)
+                strikes = count.get('strikes', 0)
                 
-                # === Count (BEFORE this pitch) ===
-                'balls': count.get('balls', 0),
-                'strikes': count.get('strikes', 0),
-                'outs': count.get('outs', 0),
+                # The API gives post-pitch count, so we need to adjust
+                # If this pitch was a ball, subtract 1 from balls
+                # If this pitch was a strike (or foul with < 2 strikes), subtract 1 from strikes
+                if details.get('isBall', False):
+                    balls = max(0, balls - 1)
+                elif details.get('isStrike', False):
+                    strikes = max(0, strikes - 1)
                 
-                # === Pitch Type ===
-                'pitch_type': details.get('type', {}).get('code', ''),
-                'pitch_name': details.get('type', {}).get('description', ''),
+                count_str = f"{balls}-{strikes}"
                 
-                # === Pitch Result ===
-                'call_code': details.get('call', {}).get('code', ''),
-                'call_description': details.get('call', {}).get('description', ''),
-                'is_strike': details.get('isStrike', False),
-                'is_ball': details.get('isBall', False),
-                'is_in_play': details.get('isInPlay', False),
-                
-                # === Velocity ===
-                'start_speed': pitch_data.get('startSpeed'),
-                'end_speed': pitch_data.get('endSpeed'),
-                
-                # === Location ===
-                'plate_x': pitch_data.get('coordinates', {}).get('pX'),
-                'plate_z': pitch_data.get('coordinates', {}).get('pZ'),
-                'zone': pitch_data.get('zone'),
-                'sz_top': pitch_data.get('strikeZoneTop'),
-                'sz_bottom': pitch_data.get('strikeZoneBottom'),
-                
-                # === Release Point ===
-                'release_x': pitch_data.get('coordinates', {}).get('x0'),
-                'release_y': pitch_data.get('coordinates', {}).get('y0'),
-                'release_z': pitch_data.get('coordinates', {}).get('z0'),
-                
-                # === Velocity Components ===
-                'vx0': pitch_data.get('coordinates', {}).get('vX0'),
-                'vy0': pitch_data.get('coordinates', {}).get('vY0'),
-                'vz0': pitch_data.get('coordinates', {}).get('vZ0'),
-                
-                # === Acceleration Components ===
-                'ax': pitch_data.get('coordinates', {}).get('aX'),
-                'ay': pitch_data.get('coordinates', {}).get('aY'),
-                'az': pitch_data.get('coordinates', {}).get('aZ'),
-                
-                # === Movement ===
-                'pfx_x': pitch_data.get('coordinates', {}).get('pfxX'),
-                'pfx_z': pitch_data.get('coordinates', {}).get('pfxZ'),
-                
-                # === Spin/Break ===
-                'spin_rate': pitch_data.get('breaks', {}).get('spinRate'),
-                'spin_direction': pitch_data.get('breaks', {}).get('spinDirection'),
-                'break_angle': pitch_data.get('breaks', {}).get('breakAngle'),
-                'break_length': pitch_data.get('breaks', {}).get('breakLength'),
-                'break_y': pitch_data.get('breaks', {}).get('breakY'),
-                
-                # === Extension ===
-                'extension': pitch_data.get('extension'),
-                
-                # === Batted Ball (if in play) ===
-                'launch_speed': hit_data.get('launchSpeed'),
-                'launch_angle': hit_data.get('launchAngle'),
-                'hit_distance': hit_data.get('totalDistance'),
-                'trajectory': hit_data.get('trajectory'),
-                'hardness': hit_data.get('hardness'),
-                'hit_x': hit_data.get('coordinates', {}).get('coordX'),
-                'hit_y': hit_data.get('coordinates', {}).get('coordY'),
-            }
-            
-            pitches.append(pitch_record)
+                # Only include valid counts
+                if pitch_type and count_str in VALID_COUNTS:
+                    pitches.append({
+                        'game_date': game_date,
+                        'pitcher_id': pitcher.get('id'),
+                        'pitcher_name': pitcher.get('fullName', ''),
+                        'batter_id': batter.get('id'),
+                        'stand': bat_side,
+                        'pitch_type': pitch_type,
+                        'balls': balls,
+                        'strikes': strikes,
+                        'count': count_str
+                    })
     
     return pitches
 
-
-def save_to_parquet(df: pd.DataFrame, month: int):
-    """Save DataFrame to monthly Parquet file, appending if exists."""
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+def main():
+    base_path = Path('data')
+    raw_path = base_path / 'raw' / str(SEASON)
+    agg_path = base_path / 'aggregated'
+    raw_path.mkdir(parents=True, exist_ok=True)
+    agg_path.mkdir(parents=True, exist_ok=True)
     
-    month_name = datetime(2000, month, 1).strftime('%m_%B').lower()
-    filepath = RAW_DIR / f"{month_name}.parquet"
-    
-    if filepath.exists():
-        # Read existing and append
-        existing_df = pd.read_parquet(filepath)
-        
-        # Remove any duplicate game_pk + pitch combinations
-        existing_keys = set(zip(existing_df['game_pk'], existing_df['at_bat_number'], existing_df['pitch_number']))
-        new_rows = df[~df.apply(lambda r: (r['game_pk'], r['at_bat_number'], r['pitch_number']) in existing_keys, axis=1)]
-        
-        if len(new_rows) > 0:
-            combined_df = pd.concat([existing_df, new_rows], ignore_index=True)
-            combined_df.to_parquet(filepath, index=False)
-            print(f"  Appended {len(new_rows)} pitches to {filepath.name}")
-        else:
-            print(f"  No new pitches to add to {filepath.name}")
+    # Determine date range to fetch
+    # Check last update
+    tracker_file = base_path / 'last_update.json'
+    if tracker_file.exists():
+        with open(tracker_file) as f:
+            tracker = json.load(f)
+        last_date = datetime.strptime(tracker.get('last_date', '2026-03-01'), '%Y-%m-%d')
     else:
-        df.to_parquet(filepath, index=False)
-        print(f"  Created {filepath.name} with {len(df)} pitches")
-
-
-def load_all_raw_data() -> pd.DataFrame:
-    """Load all raw Parquet files into a single DataFrame."""
-    all_dfs = []
+        last_date = datetime(2026, 3, 20)  # Season start
     
-    if RAW_DIR.exists():
-        for parquet_file in RAW_DIR.glob("*.parquet"):
-            df = pd.read_parquet(parquet_file)
-            all_dfs.append(df)
+    # Fetch from last_date to yesterday
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
     
-    if all_dfs:
-        return pd.concat(all_dfs, ignore_index=True)
-    return pd.DataFrame()
-
-
-def generate_pitch_usage_aggregation(df: pd.DataFrame):
-    """Generate the pitch usage by count aggregation for the app."""
-    AGG_DIR.mkdir(parents=True, exist_ok=True)
+    all_pitches = []
+    current_date = last_date
     
-    if df.empty:
-        print("No data to aggregate")
-        return
-    
-    # Filter to pitchers with 150+ pitches
-    pitcher_counts = df.groupby('pitcher_name').size()
-    qualified_pitchers = pitcher_counts[pitcher_counts >= 150].index.tolist()
-    df_qualified = df[df['pitcher_name'].isin(qualified_pitchers)]
-    
-    print(f"Aggregating data for {len(qualified_pitchers)} qualified pitchers")
-    
-    # Build the nested structure: pitcher -> batter_hand -> pitch_type -> count -> total
-    result = {}
-    
-    for pitcher_name in qualified_pitchers:
-        pitcher_df = df_qualified[df_qualified['pitcher_name'] == pitcher_name]
-        result[pitcher_name] = {}
+    while current_date <= yesterday:
+        date_str = current_date.strftime('%Y-%m-%d')
+        print(f"Fetching games for {date_str}...")
         
-        for batter_hand in ['R', 'L']:
-            hand_df = pitcher_df[pitcher_df['batter_hand'] == batter_hand]
-            if hand_df.empty:
-                continue
-            
-            result[pitcher_name][batter_hand] = {}
-            
-            for pitch_type in hand_df['pitch_type'].unique():
-                if not pitch_type:  # Skip empty pitch types
-                    continue
-                    
-                pitch_df = hand_df[hand_df['pitch_type'] == pitch_type]
-                result[pitcher_name][batter_hand][pitch_type] = {}
-                
-                # Group by count
-                for (balls, strikes), count_df in pitch_df.groupby(['balls', 'strikes']):
-                    count_key = f"{balls}-{strikes}"
-                    result[pitcher_name][batter_hand][pitch_type][count_key] = len(count_df)
-    
-    # Also create month-level aggregations
-    df['month'] = pd.to_datetime(df['game_date']).dt.month
-    
-    monthly_result = {}
-    for month in df['month'].unique():
-        month_df = df[df['month'] == month]
-        month_name = datetime(2000, int(month), 1).strftime('%B')
-        monthly_result[month_name] = {}
+        game_ids = get_schedule(date_str)
+        for game_id in game_ids:
+            pitches = get_pitch_data(game_id)
+            all_pitches.extend(pitches)
+            print(f"  Game {game_id}: {len(pitches)} pitches")
         
-        # Filter to pitchers with 50+ pitches that month
-        month_pitcher_counts = month_df.groupby('pitcher_name').size()
-        month_qualified = month_pitcher_counts[month_pitcher_counts >= 50].index.tolist()
-        month_df_qualified = month_df[month_df['pitcher_name'].isin(month_qualified)]
-        
-        for pitcher_name in month_qualified:
-            pitcher_df = month_df_qualified[month_df_qualified['pitcher_name'] == pitcher_name]
-            monthly_result[month_name][pitcher_name] = {}
-            
-            for batter_hand in ['R', 'L']:
-                hand_df = pitcher_df[pitcher_df['batter_hand'] == batter_hand]
-                if hand_df.empty:
-                    continue
-                
-                monthly_result[month_name][pitcher_name][batter_hand] = {}
-                
-                for pitch_type in hand_df['pitch_type'].unique():
-                    if not pitch_type:
-                        continue
-                    
-                    pitch_df = hand_df[hand_df['pitch_type'] == pitch_type]
-                    monthly_result[month_name][pitcher_name][batter_hand][pitch_type] = {}
-                    
-                    for (balls, strikes), count_df in pitch_df.groupby(['balls', 'strikes']):
-                        count_key = f"{balls}-{strikes}"
-                        monthly_result[month_name][pitcher_name][batter_hand][pitch_type][count_key] = len(count_df)
+        current_date += timedelta(days=1)
     
-    # Save full season aggregation
+    if all_pitches:
+        # Save to parquet by month
+        df_new = pa.Table.from_pylist(all_pitches)
+        
+        # Group by month and save
+        for month in set(p['game_date'][:7] for p in all_pitches):
+            month_num = int(month.split('-')[1])
+            month_name = MONTH_NAMES.get(month_num, f'Month{month_num}')
+            month_file = raw_path / f"{month_num:02d}_{month_name.lower()}.parquet"
+            
+            month_pitches = [p for p in all_pitches if p['game_date'].startswith(month)]
+            
+            # Load existing if present
+            if month_file.exists():
+                existing = pq.read_table(month_file).to_pylist()
+                # Merge avoiding duplicates (by game_date + pitcher_id + batter_id + count index)
+                existing_keys = set((p['game_date'], p['pitcher_id'], p['batter_id'], p.get('count', '')) for p in existing)
+                for p in month_pitches:
+                    key = (p['game_date'], p['pitcher_id'], p['batter_id'], p.get('count', ''))
+                    if key not in existing_keys:
+                        existing.append(p)
+                month_pitches = existing
+            
+            pq.write_table(pa.Table.from_pylist(month_pitches), month_file)
+            print(f"Saved {len(month_pitches)} pitches to {month_file}")
+    
+    # Now aggregate all data
+    print("\nAggregating data...")
+    
+    all_data = []
+    for parquet_file in raw_path.glob('*.parquet'):
+        table = pq.read_table(parquet_file)
+        all_data.extend(table.to_pylist())
+    
+    print(f"Total pitches: {len(all_data)}")
+    
+    # Build aggregations
+    season_data = {}  # pitcher -> stand -> pitch_type -> count -> total
+    monthly_data = {}  # month -> pitcher -> stand -> pitch_type -> count -> total
+    
+    for pitch in all_data:
+        pitcher = pitch['pitcher_name']
+        stand = pitch['stand']
+        pitch_type = pitch['pitch_type']
+        count = pitch['count']
+        month_num = int(pitch['game_date'].split('-')[1])
+        month_name = MONTH_NAMES.get(month_num, f'Month{month_num}')
+        
+        # Season aggregation
+        if pitcher not in season_data:
+            season_data[pitcher] = {}
+        if stand not in season_data[pitcher]:
+            season_data[pitcher][stand] = {}
+        if pitch_type not in season_data[pitcher][stand]:
+            season_data[pitcher][stand][pitch_type] = {}
+        season_data[pitcher][stand][pitch_type][count] = season_data[pitcher][stand][pitch_type].get(count, 0) + 1
+        
+        # Monthly aggregation
+        if month_name not in monthly_data:
+            monthly_data[month_name] = {}
+        if pitcher not in monthly_data[month_name]:
+            monthly_data[month_name][pitcher] = {}
+        if stand not in monthly_data[month_name][pitcher]:
+            monthly_data[month_name][pitcher][stand] = {}
+        if pitch_type not in monthly_data[month_name][pitcher][stand]:
+            monthly_data[month_name][pitcher][stand][pitch_type] = {}
+        monthly_data[month_name][pitcher][stand][pitch_type][count] = monthly_data[month_name][pitcher][stand][pitch_type].get(count, 0) + 1
+    
+    # Filter by minimum pitches
+    def count_pitches(pitcher_data):
+        total = 0
+        for stand_data in pitcher_data.values():
+            for pitch_data in stand_data.values():
+                for count_val in pitch_data.values():
+                    total += count_val
+        return total
+    
+    # Season qualified
+    qualified_season = {p: d for p, d in season_data.items() if count_pitches(d) >= MIN_PITCHES_SEASON}
+    
+    # Monthly qualified
+    qualified_monthly = {}
+    for month, pitchers in monthly_data.items():
+        qualified_monthly[month] = {p: d for p, d in pitchers.items() if count_pitches(d) >= MIN_PITCHES_MONTH}
+    
+    # Output
     output = {
         'season': SEASON,
         'last_updated': datetime.now().isoformat(),
-        'total_pitches': len(df),
-        'total_pitchers': len(qualified_pitchers),
-        'data': result,
-        'monthly': monthly_result
+        'total_pitches': len(all_data),
+        'total_pitchers': len(qualified_season),
+        'data': qualified_season,
+        'monthly': qualified_monthly
     }
     
-    output_path = AGG_DIR / "pitch_usage_by_count.json"
-    with open(output_path, 'w') as f:
+    output_file = agg_path / 'pitch_usage_by_count.json'
+    with open(output_file, 'w') as f:
         json.dump(output, f)
     
-    print(f"Saved aggregation to {output_path}")
-    print(f"  Total pitches: {len(df):,}")
-    print(f"  Qualified pitchers (150+ pitches): {len(qualified_pitchers)}")
+    print(f"\nSaved aggregated data to {output_file}")
+    print(f"Season qualified pitchers: {len(qualified_season)}")
+    for month, pitchers in qualified_monthly.items():
+        print(f"  {month}: {len(pitchers)} pitchers")
+    
+    # Update tracker
+    with open(tracker_file, 'w') as f:
+        json.dump({'last_date': yesterday.strftime('%Y-%m-%d'), 'last_run': datetime.now().isoformat()}, f)
 
-
-def main():
-    """Main entry point for the data fetch pipeline."""
-    print(f"=" * 50)
-    print(f"MLB Pitch Data Fetcher - {datetime.now().isoformat()}")
-    print(f"=" * 50)
-    
-    # Determine date range to fetch
-    last_update = get_last_update()
-    today = datetime.now().strftime('%Y-%m-%d')
-    
-    if last_update:
-        # Start from the day after last update
-        start_date = (datetime.strptime(last_update, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
-        print(f"Incremental update from {start_date} to {today}")
-    else:
-        # First run - start from season start
-        start_date = get_season_start(SEASON)
-        print(f"Initial fetch from {start_date} to {today}")
-    
-    # Don't fetch future dates
-    if start_date > today:
-        print("Already up to date!")
-        # Still regenerate aggregations in case we want fresh output
-        df = load_all_raw_data()
-        if not df.empty:
-            generate_pitch_usage_aggregation(df)
-        return
-    
-    # Fetch schedule
-    print(f"\nFetching schedule...")
-    games = get_schedule(start_date, today)
-    print(f"Found {len(games)} completed games")
-    
-    if not games:
-        print("No new games to process")
-        df = load_all_raw_data()
-        if not df.empty:
-            generate_pitch_usage_aggregation(df)
-        return
-    
-    # Fetch pitch data for each game
-    all_pitches = []
-    for i, game in enumerate(games):
-        print(f"  [{i+1}/{len(games)}] Fetching game {game['game_pk']} ({game['away_team']} @ {game['home_team']})...")
-        pitches = extract_pitch_data(game['game_pk'], game)
-        all_pitches.extend(pitches)
-        print(f"    → {len(pitches)} pitches")
-    
-    print(f"\nTotal new pitches: {len(all_pitches)}")
-    
-    if all_pitches:
-        # Convert to DataFrame
-        df_new = pd.DataFrame(all_pitches)
-        
-        # Save by month
-        df_new['month'] = pd.to_datetime(df_new['game_date']).dt.month
-        for month, month_df in df_new.groupby('month'):
-            save_to_parquet(month_df.drop(columns=['month']), month)
-        
-        # Update tracker
-        save_last_update(today)
-    
-    # Regenerate aggregations with all data
-    print(f"\nGenerating aggregations...")
-    df_all = load_all_raw_data()
-    generate_pitch_usage_aggregation(df_all)
-    
-    print(f"\n{'=' * 50}")
-    print(f"Complete!")
-    print(f"{'=' * 50}")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
