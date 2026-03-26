@@ -57,9 +57,8 @@ def save_last_update(date_str: str):
 
 def get_season_start(season: int) -> str:
     """Get the regular season start date (approximate)."""
-    # 2026 regular season starts ~March 26
-    # Adjust as needed for actual schedule
-    return f"{season}-03-26"
+    # 2026 regular season starts March 25
+    return f"{season}-03-25"
 
 
 def get_schedule(start_date: str, end_date: str) -> list:
