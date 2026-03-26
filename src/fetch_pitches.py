@@ -2,6 +2,7 @@
 """
 Fetch MLB pitch data from the live feed API and aggregate for the pitch usage app.
 Runs via GitHub Actions on a schedule.
+Outputs: season totals, monthly breakdowns, and game-by-game data for each pitcher.
 """
 
 import json
@@ -67,8 +68,6 @@ def get_pitch_data(game_id):
                 strikes = count.get('strikes', 0)
                 
                 # The API gives post-pitch count, so we need to adjust
-                # If this pitch was a ball, subtract 1 from balls
-                # If this pitch was a strike (or foul with < 2 strikes), subtract 1 from strikes
                 if details.get('isBall', False):
                     balls = max(0, balls - 1)
                 elif details.get('isStrike', False):
@@ -141,16 +140,10 @@ def main():
                 try:
                     existing_table = pq.read_table(month_file)
                     existing = existing_table.to_pylist()
-                    # Only merge if schema matches
                     if existing and 'stand' in existing[0]:
-                        existing_keys = set()
-                        for i, p in enumerate(existing):
-                            key = (p.get('game_date', ''), p.get('pitcher_id', ''), i)
-                            existing_keys.add(key)
                         month_pitches = existing + month_pitches
                 except Exception as e:
                     print(f"  Warning: Could not read existing {month_file}: {e}")
-                    # Will overwrite with new data
             
             pq.write_table(pa.Table.from_pylist(month_pitches), month_file)
             print(f"Saved {len(month_pitches)} pitches to {month_file}")
@@ -163,7 +156,6 @@ def main():
         try:
             table = pq.read_table(parquet_file)
             rows = table.to_pylist()
-            # Check if data has required columns
             if rows and 'stand' in rows[0] and 'pitch_type' in rows[0]:
                 all_data.extend(rows)
             else:
@@ -175,14 +167,14 @@ def main():
     
     if not all_data:
         print("No valid data to aggregate. Exiting.")
-        # Still save empty output so the file exists
         output = {
             'season': SEASON,
             'last_updated': datetime.now().isoformat(),
             'total_pitches': 0,
             'total_pitchers': 0,
             'data': {},
-            'monthly': {}
+            'monthly': {},
+            'games': {}
         }
         output_file = agg_path / 'pitch_usage_by_count.json'
         with open(output_file, 'w') as f:
@@ -192,6 +184,7 @@ def main():
     # Build aggregations
     season_data = {}
     monthly_data = {}
+    games_data = {}  # pitcher -> {games: [{date, pitches, usage}]}
     
     for pitch in all_data:
         pitcher = pitch.get('pitcher_name', '')
@@ -225,6 +218,38 @@ def main():
         if pitch_type not in monthly_data[month_name][pitcher][stand]:
             monthly_data[month_name][pitcher][stand][pitch_type] = {}
         monthly_data[month_name][pitcher][stand][pitch_type][count] = monthly_data[month_name][pitcher][stand][pitch_type].get(count, 0) + 1
+        
+        # Game-by-game aggregation
+        if pitcher not in games_data:
+            games_data[pitcher] = {}
+        if game_date not in games_data[pitcher]:
+            games_data[pitcher][game_date] = {}
+        if stand not in games_data[pitcher][game_date]:
+            games_data[pitcher][game_date][stand] = {}
+        if pitch_type not in games_data[pitcher][game_date][stand]:
+            games_data[pitcher][game_date][stand][pitch_type] = {}
+        games_data[pitcher][game_date][stand][pitch_type][count] = games_data[pitcher][game_date][stand][pitch_type].get(count, 0) + 1
+    
+    # Convert games_data to list format (sorted by date, most recent last)
+    games_output = {}
+    for pitcher, dates in games_data.items():
+        sorted_dates = sorted(dates.keys())
+        games_list = []
+        for date in sorted_dates:
+            usage = dates[date]
+            # Count total pitches for this game
+            pitch_count = sum(
+                count_val
+                for stand_data in usage.values()
+                for pitch_data in stand_data.values()
+                for count_val in pitch_data.values()
+            )
+            games_list.append({
+                'date': date,
+                'pitches': pitch_count,
+                'usage': usage
+            })
+        games_output[pitcher] = {'games': games_list}
     
     # Filter by minimum pitches
     def count_pitches(pitcher_data):
@@ -241,6 +266,8 @@ def main():
     for month, pitchers in monthly_data.items():
         qualified_monthly[month] = {p: d for p, d in pitchers.items() if count_pitches(d) >= MIN_PITCHES_MONTH}
     
+    # Include all pitchers in games_output (no minimum for game-level data)
+    
     # Output
     output = {
         'season': SEASON,
@@ -248,7 +275,8 @@ def main():
         'total_pitches': len(all_data),
         'total_pitchers': len(qualified_season),
         'data': qualified_season,
-        'monthly': qualified_monthly
+        'monthly': qualified_monthly,
+        'games': games_output
     }
     
     output_file = agg_path / 'pitch_usage_by_count.json'
@@ -259,6 +287,7 @@ def main():
     print(f"Season qualified pitchers: {len(qualified_season)}")
     for month, pitchers in qualified_monthly.items():
         print(f"  {month}: {len(pitchers)} pitchers")
+    print(f"Pitchers with game data: {len(games_output)}")
     
     # Update tracker
     with open(tracker_file, 'w') as f:
