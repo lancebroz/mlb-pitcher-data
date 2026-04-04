@@ -87,6 +87,12 @@ def get_pitch_data(game_id):
         
         play_events = play.get('playEvents', [])
         
+        # Get the play result event type (e.g., "strikeout", "single", "walk")
+        play_event_type = play_result.get('eventType', '')
+        
+        # Collect pitches for this play, then add events to the last one
+        play_pitches = []
+        
         for event in play_events:
             if not event.get('isPitch', False):
                 continue
@@ -215,9 +221,18 @@ def get_pitch_data(game_id):
                 'hardness': hit_data.get('hardness', ''),
                 'hit_x': safe_float(hit_data.get('coordinates', {}).get('coordX')),
                 'hit_y': safe_float(hit_data.get('coordinates', {}).get('coordY')),
+                
+                # Events field - will be set on last pitch of at-bat
+                'events': '',
             }
             
-            pitches.append(pitch_record)
+            play_pitches.append(pitch_record)
+        
+        # Set the play result event on the last pitch of this at-bat
+        if play_pitches and play_event_type:
+            play_pitches[-1]['events'] = play_event_type
+        
+        pitches.extend(play_pitches)
     
     return pitches
 
