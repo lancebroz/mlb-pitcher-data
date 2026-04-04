@@ -3,6 +3,7 @@
 Fetch MLB pitch data from the live feed API and aggregate for the pitch usage app.
 Runs via GitHub Actions on a schedule.
 Outputs: season totals, monthly breakdowns, and game-by-game data for each pitcher.
+Stores both daily and monthly parquet files for flexible querying.
 """
 
 import json
@@ -16,6 +17,7 @@ import pyarrow.parquet as pq
 MIN_PITCHES_SEASON = 10   # Lowered for early season
 MIN_PITCHES_MONTH = 10    # Lowered for early season
 SEASON = 2026
+REGULAR_SEASON_START = '2026-03-27'  # Opening Day - exclude spring training
 
 # Valid counts only (filter out MLB API post-pitch count bug)
 VALID_COUNTS = {'0-0', '0-1', '0-2', '1-0', '1-1', '1-2', '2-0', '2-1', '2-2', '3-0', '3-1', '3-2'}
@@ -94,8 +96,13 @@ def get_pitch_data(game_id):
 def main():
     base_path = Path('data')
     raw_path = base_path / 'raw' / str(SEASON)
+    daily_path = raw_path / 'daily'
+    monthly_path = raw_path / 'monthly'
     agg_path = base_path / 'aggregated'
-    raw_path.mkdir(parents=True, exist_ok=True)
+    
+    # Create all directories
+    daily_path.mkdir(parents=True, exist_ok=True)
+    monthly_path.mkdir(parents=True, exist_ok=True)
     agg_path.mkdir(parents=True, exist_ok=True)
     
     # Determine date range to fetch
@@ -103,67 +110,88 @@ def main():
     if tracker_file.exists():
         with open(tracker_file) as f:
             tracker = json.load(f)
-        last_date = datetime.strptime(tracker.get('last_date', '2026-03-01'), '%Y-%m-%d')
+        last_date = datetime.strptime(tracker.get('last_date', '2026-03-26'), '%Y-%m-%d')
     else:
-        last_date = datetime(2026, 3, 20)  # Season start
+        last_date = datetime(2026, 3, 26)  # Day before opening day
     
-    # Fetch from last_date to yesterday
+    # Fetch from day after last_date to yesterday
     today = datetime.now()
     yesterday = today - timedelta(days=1)
     
-    all_pitches = []
-    current_date = last_date
+    current_date = last_date + timedelta(days=1)
     
     while current_date <= yesterday:
         date_str = current_date.strftime('%Y-%m-%d')
+        
+        # Skip spring training dates
+        if date_str < REGULAR_SEASON_START:
+            current_date += timedelta(days=1)
+            continue
+            
         print(f"Fetching games for {date_str}...")
         
+        daily_file = daily_path / f"{date_str}.parquet"
+        
+        # Skip if we already have this day's data
+        if daily_file.exists():
+            print(f"  Already have data for {date_str}, skipping...")
+            current_date += timedelta(days=1)
+            continue
+        
+        day_pitches = []
         game_ids = get_schedule(date_str)
         for game_id in game_ids:
             pitches = get_pitch_data(game_id)
-            all_pitches.extend(pitches)
+            day_pitches.extend(pitches)
             print(f"  Game {game_id}: {len(pitches)} pitches")
+        
+        # Save daily parquet
+        if day_pitches:
+            pq.write_table(pa.Table.from_pylist(day_pitches), daily_file)
+            print(f"  Saved {len(day_pitches)} pitches to {daily_file}")
         
         current_date += timedelta(days=1)
     
-    if all_pitches:
-        # Group by month and save
-        for month in set(p['game_date'][:7] for p in all_pitches):
-            month_num = int(month.split('-')[1])
-            month_name = MONTH_NAMES.get(month_num, f'Month{month_num}')
-            month_file = raw_path / f"{month_num:02d}_{month_name.lower()}.parquet"
-            
-            month_pitches = [p for p in all_pitches if p['game_date'].startswith(month)]
-            
-            # Load existing if present and merge
-            if month_file.exists():
-                try:
-                    existing_table = pq.read_table(month_file)
-                    existing = existing_table.to_pylist()
-                    if existing and 'stand' in existing[0]:
-                        month_pitches = existing + month_pitches
-                except Exception as e:
-                    print(f"  Warning: Could not read existing {month_file}: {e}")
-            
-            pq.write_table(pa.Table.from_pylist(month_pitches), month_file)
-            print(f"Saved {len(month_pitches)} pitches to {month_file}")
+    # Rebuild monthly parquets from daily files
+    print("\nRebuilding monthly parquet files...")
+    monthly_data = {}  # month_str -> list of pitches
     
-    # Now aggregate all data from parquet files
+    for daily_file in sorted(daily_path.glob('*.parquet')):
+        try:
+            date_str = daily_file.stem  # e.g., "2026-03-27"
+            month_str = date_str[:7]    # e.g., "2026-03"
+            
+            table = pq.read_table(daily_file)
+            rows = table.to_pylist()
+            
+            if month_str not in monthly_data:
+                monthly_data[month_str] = []
+            monthly_data[month_str].extend(rows)
+        except Exception as e:
+            print(f"  Error reading {daily_file}: {e}")
+    
+    # Save monthly parquets
+    for month_str, pitches in monthly_data.items():
+        month_num = int(month_str.split('-')[1])
+        month_name = MONTH_NAMES.get(month_num, f'Month{month_num}')
+        month_file = monthly_path / f"{month_num:02d}_{month_name.lower()}.parquet"
+        pq.write_table(pa.Table.from_pylist(pitches), month_file)
+        print(f"  Saved {len(pitches)} pitches to {month_file}")
+    
+    # Now aggregate all data from daily files
     print("\nAggregating data...")
     
     all_data = []
-    for parquet_file in raw_path.glob('*.parquet'):
+    for daily_file in sorted(daily_path.glob('*.parquet')):
         try:
-            table = pq.read_table(parquet_file)
+            table = pq.read_table(daily_file)
             rows = table.to_pylist()
             if rows and 'stand' in rows[0] and 'pitch_type' in rows[0]:
                 all_data.extend(rows)
-            else:
-                print(f"  Skipping {parquet_file} - missing required columns")
         except Exception as e:
-            print(f"  Error reading {parquet_file}: {e}")
+            print(f"  Error reading {daily_file}: {e}")
     
-    print(f"Total pitches: {len(all_data)}")
+    print(f"Total pitches (regular season): {len(all_data)}")
     
     if not all_data:
         print("No valid data to aggregate. Exiting.")
@@ -179,6 +207,10 @@ def main():
         output_file = agg_path / 'pitch_usage_by_count.json'
         with open(output_file, 'w') as f:
             json.dump(output, f)
+        
+        # Update tracker
+        with open(tracker_file, 'w') as f:
+            json.dump({'last_date': yesterday.strftime('%Y-%m-%d'), 'last_run': datetime.now().isoformat()}, f)
         return
     
     # Build aggregations
@@ -265,8 +297,6 @@ def main():
     qualified_monthly = {}
     for month, pitchers in monthly_data.items():
         qualified_monthly[month] = {p: d for p, d in pitchers.items() if count_pitches(d) >= MIN_PITCHES_MONTH}
-    
-    # Include all pitchers in games_output (no minimum for game-level data)
     
     # Output
     output = {
