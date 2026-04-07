@@ -17,7 +17,7 @@ import pyarrow.parquet as pq
 MIN_PITCHES_SEASON = 10   # Lowered for early season
 MIN_PITCHES_MONTH = 10    # Lowered for early season
 SEASON = 2026
-REGULAR_SEASON_START = '2026-03-26'  # Opening Day - exclude spring training
+REGULAR_SEASON_START = '2026-03-27'  # Opening Day - exclude spring training
 
 # Valid counts only (filter out MLB API post-pitch count bug)
 VALID_COUNTS = {'0-0', '0-1', '0-2', '1-0', '1-1', '1-2', '2-0', '2-1', '2-2', '3-0', '3-1', '3-2'}
@@ -40,17 +40,8 @@ def get_schedule(date):
                     games.append(game['gamePk'])
     return games
 
-def safe_float(val):
-    """Safely convert a value to float, returning None if not possible."""
-    if val is None:
-        return None
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return None
-
 def get_pitch_data(game_id):
-    """Get all pitches from a game with full Statcast-equivalent data."""
+    """Get all pitches from a game."""
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
     resp = requests.get(url)
     pitches = []
@@ -59,14 +50,7 @@ def get_pitch_data(game_id):
         return pitches
     
     data = resp.json()
-    game_data = data.get('gameData', {})
-    game_date = game_data.get('datetime', {}).get('officialDate', '')
-    
-    # Get team info
-    teams = game_data.get('teams', {})
-    home_team = teams.get('home', {}).get('abbreviation', '')
-    away_team = teams.get('away', {}).get('abbreviation', '')
-    venue = game_data.get('venue', {}).get('name', '')
+    game_date = data.get('gameData', {}).get('datetime', {}).get('officialDate', '')
     
     all_plays = data.get('liveData', {}).get('plays', {}).get('allPlays', [])
     
@@ -74,165 +58,38 @@ def get_pitch_data(game_id):
         batter = play.get('matchup', {}).get('batter', {})
         pitcher = play.get('matchup', {}).get('pitcher', {})
         bat_side = play.get('matchup', {}).get('batSide', {}).get('code', '')
-        pitch_hand = play.get('matchup', {}).get('pitchHand', {}).get('code', '')
         
-        # Get the play result for batted ball data
-        play_result = play.get('result', {})
-        
-        ab_number = play.get('atBatIndex', 0)
-        inning = play.get('about', {}).get('inning', 0)
-        half = play.get('about', {}).get('halfInning', '')
-        top_bottom = 'Top' if half == 'top' else 'Bot'
-        outs = play.get('count', {}).get('outs', 0)
-        
-        play_events = play.get('playEvents', [])
-        
-        # Get the play result event type (e.g., "strikeout", "single", "walk")
-        play_event_type = play_result.get('eventType', '')
-        
-        # Collect pitches for this play, then add events to the last one
-        play_pitches = []
-        
-        for event in play_events:
-            if not event.get('isPitch', False):
-                continue
+        for event in play.get('playEvents', []):
+            if event.get('isPitch', False):
+                details = event.get('details', {})
+                pitch_type = details.get('type', {}).get('code', '')
                 
-            details = event.get('details', {})
-            pitch_type_obj = details.get('type', {})
-            pitch_type = pitch_type_obj.get('code', '')
-            pitch_name = pitch_type_obj.get('description', '')
-            
-            # Get the count BEFORE this pitch (pre-pitch count)
-            count = event.get('count', {})
-            balls = count.get('balls', 0)
-            strikes = count.get('strikes', 0)
-            
-            # The API gives post-pitch count, so we need to adjust
-            if details.get('isBall', False):
-                balls = max(0, balls - 1)
-            elif details.get('isStrike', False):
-                strikes = max(0, strikes - 1)
-            
-            count_str = f"{balls}-{strikes}"
-            
-            # Only include valid counts and valid pitch types
-            if not pitch_type or count_str not in VALID_COUNTS:
-                continue
-            
-            # Pitch data from the event
-            pitch_data_obj = event.get('pitchData', {})
-            coordinates = pitch_data_obj.get('coordinates', {})
-            breaks = pitch_data_obj.get('breaks', {})
-            
-            # Hit data (only on last pitch of at-bat if ball in play)
-            hit_data = event.get('hitData', {})
-            
-            # Call/result info
-            call_code = details.get('code', '')
-            call_desc = details.get('description', '')
-            is_strike = details.get('isStrike', False)
-            is_ball = details.get('isBall', False)
-            is_in_play = details.get('isInPlay', False)
-            
-            # Movement: convert from inches to feet (divide by 12)
-            # breakVerticalInduced is IVB in inches, breakHorizontal is HB in inches
-            raw_ivb = safe_float(breaks.get('breakVerticalInduced'))
-            raw_hb = safe_float(breaks.get('breakHorizontal'))
-            pfx_z = raw_ivb / 12.0 if raw_ivb is not None else None  # IVB inches -> feet
-            pfx_x = -raw_hb / 12.0 if raw_hb is not None else None  # HB inches -> feet (negated)
-            
-            pitch_record = {
-                # Game context
-                'game_pk': game_id,
-                'game_date': game_date,
-                'home_team': home_team,
-                'away_team': away_team,
-                'venue': venue,
-                'inning': inning,
-                'top_bottom': top_bottom,
+                # Get the count BEFORE this pitch (pre-pitch count)
+                count = event.get('count', {})
+                balls = count.get('balls', 0)
+                strikes = count.get('strikes', 0)
                 
-                # Matchup
-                'pitcher_id': pitcher.get('id'),
-                'pitcher_name': pitcher.get('fullName', ''),
-                'pitcher_hand': pitch_hand,
-                'batter_id': batter.get('id'),
-                'batter_name': batter.get('fullName', ''),
-                'batter_hand': bat_side,
-                'stand': bat_side,
+                # The API gives post-pitch count, so we need to adjust
+                if details.get('isBall', False):
+                    balls = max(0, balls - 1)
+                elif details.get('isStrike', False):
+                    strikes = max(0, strikes - 1)
                 
-                # Count
-                'balls': balls,
-                'strikes': strikes,
-                'count': count_str,
-                'outs': outs,
-                'at_bat_number': ab_number,
-                'pitch_number': event.get('pitchNumber', 0),
+                count_str = f"{balls}-{strikes}"
                 
-                # Pitch type
-                'pitch_type': pitch_type,
-                'pitch_name': pitch_name,
-                
-                # Velocity
-                'start_speed': safe_float(pitch_data_obj.get('startSpeed')),
-                'end_speed': safe_float(pitch_data_obj.get('endSpeed')),
-                
-                # Location
-                'plate_x': safe_float(coordinates.get('pX')),
-                'plate_z': safe_float(coordinates.get('pZ')),
-                'zone': safe_float(pitch_data_obj.get('zone')),
-                'sz_top': safe_float(pitch_data_obj.get('strikeZoneTop')),
-                'sz_bottom': safe_float(pitch_data_obj.get('strikeZoneBottom')),
-                
-                # Release point
-                'release_x': safe_float(coordinates.get('x0')),
-                'release_y': safe_float(coordinates.get('y0')),
-                'release_z': safe_float(coordinates.get('z0')),
-                'extension': safe_float(pitch_data_obj.get('extension')),
-                
-                # Movement (stored in feet, same as Savant)
-                'pfx_x': pfx_x,
-                'pfx_z': pfx_z,
-                'vx0': safe_float(coordinates.get('vX0')),
-                'vy0': safe_float(coordinates.get('vY0')),
-                'vz0': safe_float(coordinates.get('vZ0')),
-                'ax': safe_float(coordinates.get('aX')),
-                'ay': safe_float(coordinates.get('aY')),
-                'az': safe_float(coordinates.get('aZ')),
-                
-                # Spin
-                'spin_rate': safe_float(breaks.get('spinRate')),
-                'spin_direction': safe_float(breaks.get('spinDirection')),
-                'break_angle': safe_float(breaks.get('breakAngle')),
-                'break_length': safe_float(breaks.get('breakLength')),
-                'break_y': safe_float(breaks.get('breakY')),
-                
-                # Result
-                'call_code': call_code,
-                'call_description': call_desc,
-                'is_strike': is_strike,
-                'is_ball': is_ball,
-                'is_in_play': is_in_play,
-                
-                # Batted ball (only populated when is_in_play)
-                'launch_speed': safe_float(hit_data.get('launchSpeed')),
-                'launch_angle': safe_float(hit_data.get('launchAngle')),
-                'hit_distance': safe_float(hit_data.get('totalDistance')),
-                'trajectory': hit_data.get('trajectory', ''),
-                'hardness': hit_data.get('hardness', ''),
-                'hit_x': safe_float(hit_data.get('coordinates', {}).get('coordX')),
-                'hit_y': safe_float(hit_data.get('coordinates', {}).get('coordY')),
-                
-                # Events field - will be set on last pitch of at-bat
-                'events': '',
-            }
-            
-            play_pitches.append(pitch_record)
-        
-        # Set the play result event on the last pitch of this at-bat
-        if play_pitches and play_event_type:
-            play_pitches[-1]['events'] = play_event_type
-        
-        pitches.extend(play_pitches)
+                # Only include valid counts
+                if pitch_type and count_str in VALID_COUNTS:
+                    pitches.append({
+                        'game_date': game_date,
+                        'pitcher_id': pitcher.get('id'),
+                        'pitcher_name': pitcher.get('fullName', ''),
+                        'batter_id': batter.get('id'),
+                        'stand': bat_side,
+                        'pitch_type': pitch_type,
+                        'balls': balls,
+                        'strikes': strikes,
+                        'count': count_str
+                    })
     
     return pitches
 
@@ -253,34 +110,17 @@ def main():
     if tracker_file.exists():
         with open(tracker_file) as f:
             tracker = json.load(f)
-        last_date = datetime.strptime(tracker.get('last_date', '2026-03-25'), '%Y-%m-%d')
+        last_date = datetime.strptime(tracker.get('last_date', '2026-03-26'), '%Y-%m-%d')
     else:
-        last_date = datetime(2026, 3, 25)  # Day before opening day
+        last_date = datetime(2026, 3, 26)  # Day before opening day
     
-    # Fetch from day after last_date to yesterday
+    # Fetch from day after last_date through TODAY (not yesterday)
+    # This allows us to pick up completed games from the current day
     today = datetime.now()
-    yesterday = today - timedelta(days=1)
     
     current_date = last_date + timedelta(days=1)
     
-    # IMPORTANT: Delete old daily files so they get re-fetched with full data
-    # This is needed once to upgrade from the old 9-column format
-    existing_dailies = list(daily_path.glob('*.parquet'))
-    if existing_dailies:
-        # Check if first file has the new columns
-        try:
-            test_table = pq.read_table(existing_dailies[0])
-            if 'start_speed' not in test_table.column_names:
-                print("Detected old format daily files — deleting to re-fetch with full data...")
-                for f in existing_dailies:
-                    f.unlink()
-                # Reset last_date to re-fetch everything
-                last_date = datetime(2026, 3, 25)
-                current_date = last_date + timedelta(days=1)
-        except Exception:
-            pass
-    
-    while current_date <= yesterday:
+    while current_date <= today:
         date_str = current_date.strftime('%Y-%m-%d')
         
         # Skip spring training dates
@@ -292,8 +132,10 @@ def main():
         
         daily_file = daily_path / f"{date_str}.parquet"
         
-        # Skip if we already have this day's data
-        if daily_file.exists():
+        # For past days, skip if we already have the file
+        # For today, always re-fetch to get newly completed games
+        is_today = (current_date.date() == today.date())
+        if daily_file.exists() and not is_today:
             print(f"  Already have data for {date_str}, skipping...")
             current_date += timedelta(days=1)
             continue
@@ -305,10 +147,12 @@ def main():
             day_pitches.extend(pitches)
             print(f"  Game {game_id}: {len(pitches)} pitches")
         
-        # Save daily parquet
+        # Save daily parquet (overwrite for today to capture new games)
         if day_pitches:
             pq.write_table(pa.Table.from_pylist(day_pitches), daily_file)
             print(f"  Saved {len(day_pitches)} pitches to {daily_file}")
+        elif is_today:
+            print(f"  No completed games yet today")
         
         current_date += timedelta(days=1)
     
@@ -375,7 +219,7 @@ def main():
     
     # Build aggregations
     season_data = {}
-    monthly_agg = {}
+    monthly_data = {}
     games_data = {}  # pitcher -> {games: [{date, pitches, usage}]}
     
     for pitch in all_data:
@@ -401,15 +245,15 @@ def main():
         season_data[pitcher][stand][pitch_type][count] = season_data[pitcher][stand][pitch_type].get(count, 0) + 1
         
         # Monthly aggregation
-        if month_name not in monthly_agg:
-            monthly_agg[month_name] = {}
-        if pitcher not in monthly_agg[month_name]:
-            monthly_agg[month_name][pitcher] = {}
-        if stand not in monthly_agg[month_name][pitcher]:
-            monthly_agg[month_name][pitcher][stand] = {}
-        if pitch_type not in monthly_agg[month_name][pitcher][stand]:
-            monthly_agg[month_name][pitcher][stand][pitch_type] = {}
-        monthly_agg[month_name][pitcher][stand][pitch_type][count] = monthly_agg[month_name][pitcher][stand][pitch_type].get(count, 0) + 1
+        if month_name not in monthly_data:
+            monthly_data[month_name] = {}
+        if pitcher not in monthly_data[month_name]:
+            monthly_data[month_name][pitcher] = {}
+        if stand not in monthly_data[month_name][pitcher]:
+            monthly_data[month_name][pitcher][stand] = {}
+        if pitch_type not in monthly_data[month_name][pitcher][stand]:
+            monthly_data[month_name][pitcher][stand][pitch_type] = {}
+        monthly_data[month_name][pitcher][stand][pitch_type][count] = monthly_data[month_name][pitcher][stand][pitch_type].get(count, 0) + 1
         
         # Game-by-game aggregation
         if pitcher not in games_data:
@@ -455,7 +299,7 @@ def main():
     qualified_season = {p: d for p, d in season_data.items() if count_pitches(d) >= MIN_PITCHES_SEASON}
     
     qualified_monthly = {}
-    for month, pitchers in monthly_agg.items():
+    for month, pitchers in monthly_data.items():
         qualified_monthly[month] = {p: d for p, d in pitchers.items() if count_pitches(d) >= MIN_PITCHES_MONTH}
     
     # Output
@@ -479,7 +323,8 @@ def main():
         print(f"  {month}: {len(pitchers)} pitchers")
     print(f"Pitchers with game data: {len(games_output)}")
     
-    # Update tracker
+    # Update tracker - set to yesterday so we always re-check today on next run
+    yesterday = today - timedelta(days=1)
     with open(tracker_file, 'w') as f:
         json.dump({'last_date': yesterday.strftime('%Y-%m-%d'), 'last_run': datetime.now().isoformat()}, f)
 
