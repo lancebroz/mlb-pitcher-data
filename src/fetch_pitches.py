@@ -274,8 +274,8 @@ def main():
         games_data[pitcher][game_date]['usage'][stand][pitch_type][count] = games_data[pitcher][game_date]['usage'][stand][pitch_type].get(count, 0) + 1
         
         # Track unique innings pitched (inning + half_inning for uniqueness)
-        inning = row.get('inning', 0)
-        half_inning = row.get('half_inning', '')
+        inning = pitch.get('inning', 0)
+        half_inning = pitch.get('half_inning', '')
         if inning and half_inning:
             games_data[pitcher][game_date]['innings'].add((inning, half_inning))
     
