@@ -259,9 +259,9 @@ def get_pitch_data(game_id):
                 'release_z': _f(coords.get('z0')),
                 'extension': _f(pitch_data.get('extension')),
 
-                # Movement (pfx in inches per Savant convention - MLB returns in feet, multiply by 12)
-                'pfx_x': _f(coords.get('pfxX')) * 12 if _f(coords.get('pfxX')) is not None else None,
-                'pfx_z': _f(coords.get('pfxZ')) * 12 if _f(coords.get('pfxZ')) is not None else None,
+                # Movement (pfx in feet from MLB API; frontend normalizes to inches)
+                'pfx_x': _f(coords.get('pfxX')),
+                'pfx_z': _f(coords.get('pfxZ')),
                 'vx0': _f(coords.get('vX0')),
                 'vy0': _f(coords.get('vY0')),
                 'vz0': _f(coords.get('vZ0')),
@@ -315,6 +315,7 @@ def main():
     # ── Auto-cleanup: detect daily files written by the OLD broken script ──
     # The old version wrote ~11 columns. The new version writes ~50.
     # Any file with the old schema gets deleted so it'll be re-fetched fresh.
+    # Also detects files where pfx_x/pfx_z were wrongly stored in inches (legacy bug).
     REQUIRED_COLUMNS = {'ax', 'ay', 'az', 'start_speed', 'spin_rate', 'pfx_x', 'pfx_z'}
     deleted_count = 0
     for daily_file in sorted(daily_path.glob('*.parquet')):
@@ -325,6 +326,22 @@ def main():
                 print(f"  [cleanup] Deleting {daily_file.name} - missing columns from old schema")
                 daily_file.unlink()
                 deleted_count += 1
+                continue
+            # Check if pfx values look wrong (in inches when they should be in feet).
+            # MLB pfx values in feet are typically -2 to +2; in inches they'd be -24 to +24.
+            try:
+                t = pq.read_table(daily_file, columns=['pfx_x', 'pfx_z'])
+                df = t.to_pandas()
+                # Drop NaN before checking
+                vals = df.dropna()
+                if len(vals) > 10:
+                    max_abs = max(vals['pfx_x'].abs().max(), vals['pfx_z'].abs().max())
+                    if max_abs > 5:  # >5 feet means values are in inches (bug)
+                        print(f"  [cleanup] Deleting {daily_file.name} - pfx values look like inches (max={max_abs:.1f})")
+                        daily_file.unlink()
+                        deleted_count += 1
+            except Exception as inner_e:
+                print(f"  [cleanup] Could not check pfx values for {daily_file.name}: {inner_e}")
         except Exception as e:
             print(f"  [cleanup] Could not read {daily_file.name}: {e} - deleting")
             try:
