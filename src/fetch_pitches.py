@@ -209,6 +209,14 @@ def get_pitch_data(game_id):
             is_ball = bool(details.get('isBall', False))
             is_in_play = bool(details.get('isInPlay', False))
 
+            # Movement: use breaks.breakVerticalInduced + breakHorizontal which match
+            # Savant's IVB/HB (in inches). pfxX/pfxZ from coordinates uses different units.
+            # We divide by 12 to store in feet (matches Savant CSV convention used elsewhere).
+            raw_ivb = breaks.get('breakVerticalInduced')
+            raw_hb = breaks.get('breakHorizontal')
+            pfx_z_ft = (raw_ivb / 12.0) if raw_ivb is not None else None
+            pfx_x_ft = (raw_hb / 12.0) if raw_hb is not None else None
+
             # Full Statcast-equivalent record
             row = {
                 # Game context
@@ -259,9 +267,9 @@ def get_pitch_data(game_id):
                 'release_z': _f(coords.get('z0')),
                 'extension': _f(pitch_data.get('extension')),
 
-                # Movement (pfx in feet from MLB API; frontend normalizes to inches)
-                'pfx_x': _f(coords.get('pfxX')),
-                'pfx_z': _f(coords.get('pfxZ')),
+                # Movement (in feet, matches Savant CSV convention)
+                'pfx_x': pfx_x_ft,
+                'pfx_z': pfx_z_ft,
                 'vx0': _f(coords.get('vX0')),
                 'vy0': _f(coords.get('vY0')),
                 'vz0': _f(coords.get('vZ0')),
