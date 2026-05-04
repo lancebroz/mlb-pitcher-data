@@ -215,7 +215,7 @@ def get_pitch_data(game_id):
             raw_ivb = breaks.get('breakVerticalInduced')
             raw_hb = breaks.get('breakHorizontal')
             pfx_z_ft = (raw_ivb / 12.0) if raw_ivb is not None else None
-            pfx_x_ft = (raw_hb / 12.0) if raw_hb is not None else None
+            pfx_x_ft = (-raw_hb / 12.0) if raw_hb is not None else None
 
             # Full Statcast-equivalent record
             row = {
@@ -340,12 +340,21 @@ def main():
             try:
                 t = pq.read_table(daily_file, columns=['pfx_x', 'pfx_z'])
                 df = t.to_pandas()
-                # Drop NaN before checking
                 vals = df.dropna()
                 if len(vals) > 10:
                     max_abs = max(vals['pfx_x'].abs().max(), vals['pfx_z'].abs().max())
                     if max_abs > 5:  # >5 feet means values are in inches (bug)
                         print(f"  [cleanup] Deleting {daily_file.name} - pfx values look like inches (max={max_abs:.1f})")
+                        daily_file.unlink()
+                        deleted_count += 1
+                        continue
+                    # One-time sign-flip cleanup: delete all files so they get re-fetched
+                    # with corrected HB sign convention. This block can be removed after
+                    # one full re-fetch cycle completes successfully.
+                    SIGN_FIX_DATE = '2026-05-04'  # marker date
+                    sign_fix_marker = base_path / '.sign_fix_applied'
+                    if not sign_fix_marker.exists():
+                        print(f"  [cleanup] Deleting {daily_file.name} - one-time HB sign correction")
                         daily_file.unlink()
                         deleted_count += 1
             except Exception as inner_e:
