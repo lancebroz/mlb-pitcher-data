@@ -31,7 +31,7 @@ from zoneinfo import ZoneInfo
 MIN_PITCHES_SEASON = 10
 MIN_PITCHES_MONTH = 10
 SEASON = 2026
-REGULAR_SEASON_START = '2026-03-27'
+REGULAR_SEASON_START = '2026-03-25'  # Opening Day 2026 was March 25 (no Japan series this season)
 CENTRAL_TZ = ZoneInfo('America/Chicago')
 
 VALID_COUNTS = {'0-0', '0-1', '0-2', '1-0', '1-1', '1-2', '2-0', '2-1', '2-2', '3-0', '3-1', '3-2'}
@@ -339,13 +339,23 @@ def main():
             tracker_file.unlink()
             print(f"  [cleanup] Reset tracker - will re-fetch from {REGULAR_SEASON_START}")
 
+    # ── Also force re-fetch if Opening Day (March 25-26) parquets are missing ──
+    # This handles the case where the previous version of the script had the wrong
+    # REGULAR_SEASON_START and skipped these dates entirely.
+    expected_opening = ['2026-03-25', '2026-03-26']
+    missing_opening = [d for d in expected_opening if not (daily_path / f"{d}.parquet").exists()]
+    if missing_opening:
+        print(f"  [cleanup] Missing Opening Day parquets: {missing_opening} - resetting tracker")
+        if tracker_file.exists():
+            tracker_file.unlink()
+
     # Read tracker to determine where to start fetching from
     if tracker_file.exists():
         with open(tracker_file) as f:
             tracker = json.load(f)
-        last_date = datetime.strptime(tracker.get('last_date', '2026-03-26'), '%Y-%m-%d')
+        last_date = datetime.strptime(tracker.get('last_date', '2026-03-24'), '%Y-%m-%d')
     else:
-        last_date = datetime(2026, 3, 26)
+        last_date = datetime(2026, 3, 24)  # Day before Opening Day
 
     today = datetime.now(CENTRAL_TZ).replace(tzinfo=None)
     current_date = last_date + timedelta(days=1)
