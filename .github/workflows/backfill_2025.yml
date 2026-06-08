@@ -1,0 +1,38 @@
+name: Backfill 2025 Pitch Data
+
+on:
+  workflow_dispatch:   # manual "Run workflow" button only
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pyarrow
+
+      - name: Run 2025 backfill
+        run: python src/backfill_2025.py
+
+      - name: Commit and push 2025 data
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/raw/2025
+          if git diff --cached --quiet; then
+            echo "No new data to commit"
+          else
+            git commit -m "Backfill 2025 pitch data"
+            git push
+          fi
