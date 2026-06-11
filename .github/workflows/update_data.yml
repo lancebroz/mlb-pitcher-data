@@ -6,32 +6,43 @@ on:
     - cron: '*/30 * * * *'
   workflow_dispatch:  # Allow manual trigger
 
+# Never let two runs overlap: a second trigger waits for the first to finish.
+# Without this, overlapping runs can race each other's pushes.
+concurrency:
+  group: update-pitch-data
+  cancel-in-progress: false
+
 jobs:
   update-data:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        
+
     - name: Install dependencies
       run: pip install -r requirements.txt
-      
+
     - name: Run pitch data fetcher
       run: python src/fetch_pitches.py
-      
+
     - name: Configure git
       run: |
         git config user.email "github-actions[bot]@users.noreply.github.com"
         git config user.name "github-actions[bot]"
-        
+
     - name: Commit and push changes
       run: |
         git add -A
         git diff --staged --quiet || git commit -m "Update pitch data $(date -u +'%Y-%m-%d %H:%M UTC')"
-        git push
+        # If anything was pushed to main while this run was in flight (e.g. a
+        # manual edit to the script), rebase our data commit on top of it
+        # instead of failing with "fetch first". Retry once in case of a
+        # second race during the push itself.
+        git pull --rebase --autostash origin main
+        git push || (git pull --rebase --autostash origin main && git push)
