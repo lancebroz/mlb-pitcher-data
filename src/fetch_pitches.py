@@ -148,6 +148,10 @@ def get_pitch_data(game_id):
             if not event.get('isPitch', False):
                 continue
 
+            # Per-pitch UUID from the live feed. Links directly to MLB's research/video
+            # tools: https://research.mlb.com/games/{game_pk}/plays/{play_id}
+            play_id = event.get('playId', '') or ''
+
             details = event.get('details', {})
             pitch_data = event.get('pitchData') or {}
             hit_data = event.get('hitData') or {}
@@ -222,6 +226,7 @@ def get_pitch_data(game_id):
                 # Game context
                 'game_pk': game_id,
                 'game_date': game_date,
+                'play_id': play_id,  # MLB per-pitch UUID for video/research deep links
                 'home_team': home_team,
                 'away_team': away_team,
                 'venue': venue,
@@ -324,7 +329,9 @@ def main():
     # The old version wrote ~11 columns. The new version writes ~50.
     # Any file with the old schema gets deleted so it'll be re-fetched fresh.
     # Also detects files where pfx_x/pfx_z were wrongly stored in inches (legacy bug).
-    REQUIRED_COLUMNS = {'ax', 'ay', 'az', 'start_speed', 'spin_rate', 'pfx_x', 'pfx_z'}
+    # 'play_id' added 2026-06: its absence triggers a one-time full-season re-fetch
+    # so every historical pitch gains the video/research deep-link UUID.
+    REQUIRED_COLUMNS = {'ax', 'ay', 'az', 'start_speed', 'spin_rate', 'pfx_x', 'pfx_z', 'play_id'}
     deleted_count = 0
     for daily_file in sorted(daily_path.glob('*.parquet')):
         try:
