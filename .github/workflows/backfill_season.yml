@@ -1,0 +1,62 @@
+name: Backfill Season Pitch Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Season to backfill"
+        required: true
+        type: choice
+        options:
+          - "2024"
+          - "2023"
+          - "2022"
+          - "2025"
+      monthly_only:
+        description: "Keep only monthly parquets (halves repo footprint)"
+        required: false
+        type: boolean
+        default: true
+      refresh:
+        description: "Re-fetch days that already have a daily file"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pyarrow
+
+      - name: Run season backfill
+        run: |
+          ARGS="--season ${{ inputs.season }}"
+          if [ "${{ inputs.monthly_only }}" = "true" ]; then ARGS="$ARGS --monthly-only"; fi
+          if [ "${{ inputs.refresh }}" = "true" ]; then ARGS="$ARGS --refresh"; fi
+          python src/backfill_season.py $ARGS
+
+      - name: Commit and push season data
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/raw/${{ inputs.season }}
+          if git diff --cached --quiet; then
+            echo "No new data to commit"
+          else
+            git commit -m "Backfill ${{ inputs.season }} pitch data"
+            git push
+          fi
