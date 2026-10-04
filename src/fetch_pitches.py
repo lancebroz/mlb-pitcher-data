@@ -73,8 +73,14 @@ def _s(v, default=''):
     return default if s in ('nan', 'None', 'NaN') else s
 
 
+# Game types to ingest: R = regular season, F = Wild Card, D = Division Series,
+# L = League Championship Series, W = World Series. Spring (S), exhibitions (E)
+# and the All-Star Game (A) stay excluded.
+INGESTED_GAME_TYPES = {'R', 'F', 'D', 'L', 'W'}
+
+
 def get_schedule(date):
-    """Get final-status game IDs for a given date (regular season only)."""
+    """Get final-status game IDs for a given date (regular season + postseason)."""
     url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
     try:
         resp = requests.get(url, timeout=15)
@@ -88,8 +94,8 @@ def get_schedule(date):
             for game in date_entry.get('games', []):
                 # Only Final games
                 if game.get('status', {}).get('abstractGameState') == 'Final':
-                    # Only regular season (gameType R = regular)
-                    if game.get('gameType') == 'R':
+                    # Regular season + postseason (see INGESTED_GAME_TYPES)
+                    if game.get('gameType') in INGESTED_GAME_TYPES:
                         games.append(game['gamePk'])
     return games
 
@@ -396,7 +402,20 @@ def main():
             tracker = json.load(f)
         last_date = datetime.strptime(tracker.get('last_date', '2026-03-24'), '%Y-%m-%d')
     else:
+        tracker = {}
         last_date = datetime(2026, 3, 24)  # Day before Opening Day
+
+    # ── One-time postseason backfill (Oct 2026) ──
+    # Earlier versions only ingested gameType 'R', so every postseason game was
+    # discarded while the tracker kept advancing day by day. If the tracker is
+    # already past the end of the regular season and the backfill hasn't run,
+    # rewind the start once to the final regular-season day. Existing daily
+    # parquets are skipped by the loop below, so this only fetches the missing
+    # postseason dates and then sets the flag.
+    POSTSEASON_RESUME = datetime(2026, 9, 27)
+    if last_date > POSTSEASON_RESUME and not tracker.get('postseason_backfill_done'):
+        print("  [cleanup] Postseason backfill: rewinding fetch start to 2026-09-28")
+        last_date = POSTSEASON_RESUME
 
     today = datetime.now(CENTRAL_TZ).replace(tzinfo=None)
     current_date = last_date + timedelta(days=1)
@@ -501,7 +520,8 @@ def main():
         with open(tracker_file, 'w') as f:
             json.dump({
                 'last_date': yesterday.strftime('%Y-%m-%d'),
-                'last_run': datetime.now(CENTRAL_TZ).isoformat()
+                'last_run': datetime.now(CENTRAL_TZ).isoformat(),
+                'postseason_backfill_done': True
             }, f)
         return
 
@@ -612,7 +632,8 @@ def main():
     with open(tracker_file, 'w') as f:
         json.dump({
             'last_date': yesterday.strftime('%Y-%m-%d'),
-            'last_run': datetime.now(CENTRAL_TZ).isoformat()
+            'last_run': datetime.now(CENTRAL_TZ).isoformat(),
+            'postseason_backfill_done': True
         }, f)
 
 
