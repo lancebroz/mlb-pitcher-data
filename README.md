@@ -17,7 +17,7 @@ Full pitch-level Statcast-equivalent data in Parquet format, partitioned by mont
 |----------|--------|
 | **Game Context** | game_pk, game_date, home_team, away_team, venue, inning, top_bottom |
 | **Matchup** | pitcher_id, pitcher_name, pitcher_hand, batter_id, batter_name, batter_hand |
-| **Count** | balls, strikes, outs, at_bat_number, pitch_number |
+| **Count** | balls, strikes (before the pitch), outs (when the batter came up), on_1b, on_2b, on_3b (runners on before the pitch), at_bat_number, pitch_number |
 | **Pitch Type** | pitch_type (code), pitch_name |
 | **Velocity** | start_speed, end_speed |
 | **Location** | plate_x, plate_z, zone, sz_top, sz_bottom |

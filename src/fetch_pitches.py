@@ -9,6 +9,7 @@ Extracts every field the downstream apps expect:
   - Movement (pfx_x, pfx_z, vx0, vy0, vz0, ax, ay, az)
   - Spin (spin_rate, spin_direction, break_angle, break_length, break_y)
   - Location (plate_x, plate_z, zone, sz_top, sz_bottom)
+  - Situation (balls, strikes and outs before the pitch; on_1b, on_2b, on_3b)
   - Result (call_code, call_description, is_strike, is_ball, is_in_play, type)
   - Batted ball (launch_speed, launch_angle, hit_distance, trajectory, hardness, hit_x, hit_y)
 
@@ -73,23 +74,72 @@ def _s(v, default=''):
     return default if s in ('nan', 'None', 'NaN') else s
 
 
+BASES = ('1B', '2B', '3B')
+
+
+def _runner_moves(play):
+    """Runner movements of a play, grouped by the index of the play event they happened on."""
+    moves = {}
+    for r in play.get('runners') or []:
+        mv = r.get('movement') or {}
+        det = r.get('details') or {}
+        rid = (det.get('runner') or {}).get('id')
+        moves.setdefault(det.get('playIndex'), []).append(
+            (rid, mv.get('start'), mv.get('end'), bool(mv.get('isOut'))))
+    return moves
+
+
+def _apply_moves(pos, moves):
+    """Advance the {runner_id: base} map by one play event's runner movements."""
+    for rid, start, end, is_out in moves:
+        key = rid
+        if key not in pos and start in BASES:
+            # Runner we only know by the base he started on
+            key = next((k for k, b in pos.items() if b == start), rid)
+        pos.pop(key, None)
+        if not is_out and end in BASES:
+            pos[rid if rid is not None else key] = end
+
+
+def _post_play_bases(play):
+    """{runner_id: base} after a play, from the feed's own post-play fields."""
+    m = play.get('matchup') or {}
+    pos = {}
+    for field, base in (('postOnFirst', '1B'), ('postOnSecond', '2B'), ('postOnThird', '3B')):
+        rid = (m.get(field) or {}).get('id')
+        if rid is not None:
+            pos[rid] = base
+    return pos
+
+
 # Game types to ingest: R = regular season, F = Wild Card, D = Division Series,
 # L = League Championship Series, W = World Series. Spring (S), exhibitions (E)
 # and the All-Star Game (A) stay excluded.
 INGESTED_GAME_TYPES = {'R', 'F', 'D', 'L', 'W'}
 
 
+def _get_json(url, timeout, attempts=3):
+    """GET a JSON document, retrying transient failures. Returns None if every attempt fails."""
+    import time
+    for attempt in range(attempts):
+        try:
+            resp = requests.get(url, timeout=timeout)
+            if resp.ok:
+                return resp.json()
+            print(f"  HTTP {resp.status_code} for {url} (attempt {attempt + 1}/{attempts})")
+        except Exception as e:
+            print(f"  Fetch failed for {url} (attempt {attempt + 1}/{attempts}): {e}")
+        if attempt < attempts - 1:
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
 def get_schedule(date):
     """Get final-status game IDs for a given date (regular season + postseason)."""
     url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={date}"
-    try:
-        resp = requests.get(url, timeout=15)
-    except Exception as e:
-        print(f"  Schedule fetch failed for {date}: {e}")
-        return []
     games = []
-    if resp.ok:
-        data = resp.json()
+    data = _get_json(url, timeout=15)
+    if data is not None:
         for date_entry in data.get('dates', []):
             for game in date_entry.get('games', []):
                 # Only Final games
@@ -103,17 +153,12 @@ def get_schedule(date):
 def get_pitch_data(game_id):
     """Get all pitches from a game with FULL Statcast schema."""
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
-    try:
-        resp = requests.get(url, timeout=30)
-    except Exception as e:
-        print(f"  Feed fetch failed for game {game_id}: {e}")
-        return []
-
-    if not resp.ok:
+    data = _get_json(url, timeout=30)
+    if data is None:
+        print(f"  Feed fetch failed for game {game_id}")
         return []
 
     pitches = []
-    data = resp.json()
     game_data = data.get('gameData', {})
     live_data = data.get('liveData', {})
 
@@ -128,9 +173,24 @@ def get_pitch_data(game_id):
         'line_drive': 'line_drive', 'popup': 'popup',
     }
 
+    prev_half = None      # (inning, halfInning) of the previous play
+    carried = {}          # {runner_id: base} after the previous play
+
     for play in all_plays:
         matchup = play.get('matchup', {})
         about = play.get('about', {})
+
+        # Runners on base when this play starts: whoever the previous play of the
+        # same half inning left on. Runner movements inside the play (steals, wild
+        # pitches, the extra-inning placed runner) are applied event by event below.
+        this_half = (about.get('inning'), about.get('halfInning'))
+        pos = dict(carried) if this_half == prev_half else {}
+        prev_half = this_half
+        carried = _post_play_bases(play)
+        moves_by_event = _runner_moves(play)
+        # Count before the next pitch, tracked through every play event (pitches,
+        # automatic balls/strikes, ...) rather than backed out of the post-pitch count.
+        pre_balls, pre_strikes = 0, 0
 
         batter = matchup.get('batter', {})
         pitcher = matchup.get('pitcher', {})
@@ -150,7 +210,36 @@ def get_pitch_data(game_id):
         result = play.get('result', {})
         events = result.get('eventType', '')
 
-        for event in play.get('playEvents', []):
+        for ev_index, event in enumerate(play.get('playEvents', [])):
+            # State BEFORE this event, then advance the trackers for the next one.
+            on_1b = '1B' in pos.values()
+            on_2b = '2B' in pos.values()
+            on_3b = '3B' in pos.values()
+            balls, strikes = pre_balls, pre_strikes
+            try:
+                _apply_moves(pos, moves_by_event.get(event.get('index', ev_index), []))
+            except Exception:
+                pass
+            if not event.get('isPitch', False):
+                # Runners that appear or change identity without a runner movement:
+                # the extra-inning placed runner, and pinch runners.
+                try:
+                    ev_base = event.get('base')
+                    ev_base = {1: '1B', 2: '2B', 3: '3B'}.get(ev_base, ev_base if ev_base in BASES else None)
+                    ev_player = (event.get('player') or {}).get('id')
+                    ev_type = (event.get('details') or {}).get('eventType')
+                    replaced = (event.get('replacedPlayer') or {}).get('id')
+                    if ev_type == 'runner_placed' and ev_base and ev_player is not None:
+                        pos[ev_player] = ev_base
+                    elif replaced is not None and replaced in pos and ev_player is not None:
+                        pos[ev_player] = pos.pop(replaced)
+                except Exception:
+                    pass
+            ev_count = event.get('count') or {}
+            if ev_count.get('balls') is not None and ev_count.get('strikes') is not None:
+                pre_balls = min(int(ev_count['balls']), 3)
+                pre_strikes = min(int(ev_count['strikes']), 2)
+
             if not event.get('isPitch', False):
                 continue
 
@@ -168,18 +257,11 @@ def get_pitch_data(game_id):
             pitch_type_code = pitch_type_obj.get('code', '')
             pitch_name = pitch_type_obj.get('description', '')
 
-            # Pre-pitch count (back out the post-pitch adjustment)
+            # Pre-pitch count: tracked above. (Backing it out of the post-pitch count
+            # filed every two-strike foul as a one-strike pitch.)
+            # `outs` in the feed is the number of outs when the batter came up.
             count = event.get('count', {}) or {}
-            balls_post = count.get('balls', 0) or 0
-            strikes_post = count.get('strikes', 0) or 0
             outs = count.get('outs', 0) or 0
-
-            balls = balls_post
-            strikes = strikes_post
-            if details.get('isBall', False):
-                balls = max(0, balls - 1)
-            elif details.get('isStrike', False):
-                strikes = max(0, strikes - 1)
 
             count_str = f"{balls}-{strikes}"
 
@@ -253,7 +335,10 @@ def get_pitch_data(game_id):
                 'balls': balls,
                 'strikes': strikes,
                 'count': count_str,
-                'outs': outs,
+                'outs': outs,                 # outs when the batter came up
+                'on_1b': on_1b,               # runner on first before the pitch
+                'on_2b': on_2b,
+                'on_3b': on_3b,
                 'at_bat_number': at_bat_index,
                 'pitch_number': event.get('pitchNumber', 0),
 
@@ -337,7 +422,9 @@ def main():
     # Also detects files where pfx_x/pfx_z were wrongly stored in inches (legacy bug).
     # 'play_id' added 2026-06: its absence triggers a one-time full-season re-fetch
     # so every historical pitch gains the video/research deep-link UUID.
-    REQUIRED_COLUMNS = {'ax', 'ay', 'az', 'start_speed', 'spin_rate', 'pfx_x', 'pfx_z', 'play_id'}
+    # 'on_1b' added 2026-11 (runners on base before each pitch, plus the corrected
+    # pre-pitch count): its absence triggers the same one-time full-season re-fetch.
+    REQUIRED_COLUMNS = {'ax', 'ay', 'az', 'start_speed', 'spin_rate', 'pfx_x', 'pfx_z', 'play_id', 'on_1b'}
     deleted_count = 0
     for daily_file in sorted(daily_path.glob('*.parquet')):
         try:
@@ -461,6 +548,26 @@ def main():
 
         current_date += timedelta(days=1)
 
+    # ── A postponed game stays on the schedule of its original date, so its pitches
+    # land in two daily files: the original date and the date it was played. Find the
+    # games that have a copy under their own official date; the stray copy is dropped
+    # from the monthly files and the aggregates below (never from the daily files, so
+    # no game can be lost).
+    home_games = set()
+    for daily_file in sorted(daily_path.glob('*.parquet')):
+        try:
+            t = pq.read_table(daily_file, columns=['game_pk', 'game_date'])
+            for pk, gd in set(zip(t.column('game_pk').to_pylist(), t.column('game_date').to_pylist())):
+                if gd == daily_file.stem:
+                    home_games.add(pk)
+        except Exception as e:
+            print(f"  Error scanning {daily_file}: {e}")
+
+    def own_rows(daily_file, rows):
+        """Rows of a daily file minus games that belong to (and exist under) another date."""
+        day = daily_file.stem
+        return [r for r in rows if r.get('game_date') == day or r.get('game_pk') not in home_games]
+
     # ── Rebuild monthly parquets from all dailies ──
     print("\nRebuilding monthly parquets...")
     monthly_data = {}
@@ -469,7 +576,7 @@ def main():
             date_str = daily_file.stem
             month_str = date_str[:7]
             table = pq.read_table(daily_file)
-            rows = table.to_pylist()
+            rows = own_rows(daily_file, table.to_pylist())
             if month_str not in monthly_data:
                 monthly_data[month_str] = []
             monthly_data[month_str].extend(rows)
@@ -492,7 +599,7 @@ def main():
     for daily_file in sorted(daily_path.glob('*.parquet')):
         try:
             table = pq.read_table(daily_file)
-            rows = table.to_pylist()
+            rows = own_rows(daily_file, table.to_pylist())
             for r in rows:
                 # Only include rows with the fields needed by aggregation
                 if r.get('stand') and r.get('pitch_type') and r.get('count') in VALID_COUNTS:
