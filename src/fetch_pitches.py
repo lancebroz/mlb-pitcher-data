@@ -213,6 +213,21 @@ def get_pitch_data(game_id):
                 _apply_moves(pos, moves_by_event.get(event.get('index', ev_index), []))
             except Exception:
                 pass
+            if not event.get('isPitch', False):
+                # Runners that appear or change identity without a runner movement:
+                # the extra-inning placed runner, and pinch runners.
+                try:
+                    ev_base = event.get('base')
+                    ev_base = {1: '1B', 2: '2B', 3: '3B'}.get(ev_base, ev_base if ev_base in BASES else None)
+                    ev_player = (event.get('player') or {}).get('id')
+                    ev_type = (event.get('details') or {}).get('eventType')
+                    replaced = (event.get('replacedPlayer') or {}).get('id')
+                    if ev_type == 'runner_placed' and ev_base and ev_player is not None:
+                        pos[ev_player] = ev_base
+                    elif replaced is not None and replaced in pos and ev_player is not None:
+                        pos[ev_player] = pos.pop(replaced)
+                except Exception:
+                    pass
             ev_count = event.get('count') or {}
             if ev_count.get('balls') is not None and ev_count.get('strikes') is not None:
                 pre_balls = min(int(ev_count['balls']), 3)
