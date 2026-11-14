@@ -1,0 +1,28 @@
+name: Validate fetch (branch check)
+
+on:
+  push:
+    branches: [base-out-fields]
+    paths: ['src/**', '.github/workflows/validate_fetch.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests pyarrow
+      - run: python src/validate_fetch.py
+      - name: Commit sample
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add validation
+          git diff --staged --quiet || git commit -m "Validation sample"
+          git push

@@ -73,6 +73,44 @@ def _s(v, default=''):
     return default if s in ('nan', 'None', 'NaN') else s
 
 
+BASES = ('1B', '2B', '3B')
+
+
+def _runner_moves(play):
+    """Runner movements of a play, grouped by the index of the play event they happened on."""
+    moves = {}
+    for r in play.get('runners') or []:
+        mv = r.get('movement') or {}
+        det = r.get('details') or {}
+        rid = (det.get('runner') or {}).get('id')
+        moves.setdefault(det.get('playIndex'), []).append(
+            (rid, mv.get('start'), mv.get('end'), bool(mv.get('isOut'))))
+    return moves
+
+
+def _apply_moves(pos, moves):
+    """Advance the {runner_id: base} map by one play event's runner movements."""
+    for rid, start, end, is_out in moves:
+        key = rid
+        if key not in pos and start in BASES:
+            # Runner we only know by the base he started on
+            key = next((k for k, b in pos.items() if b == start), rid)
+        pos.pop(key, None)
+        if not is_out and end in BASES:
+            pos[rid if rid is not None else key] = end
+
+
+def _post_play_bases(play):
+    """{runner_id: base} after a play, from the feed's own post-play fields."""
+    m = play.get('matchup') or {}
+    pos = {}
+    for field, base in (('postOnFirst', '1B'), ('postOnSecond', '2B'), ('postOnThird', '3B')):
+        rid = (m.get(field) or {}).get('id')
+        if rid is not None:
+            pos[rid] = base
+    return pos
+
+
 # Game types to ingest: R = regular season, F = Wild Card, D = Division Series,
 # L = League Championship Series, W = World Series. Spring (S), exhibitions (E)
 # and the All-Star Game (A) stay excluded.
@@ -128,9 +166,24 @@ def get_pitch_data(game_id):
         'line_drive': 'line_drive', 'popup': 'popup',
     }
 
+    prev_half = None      # (inning, halfInning) of the previous play
+    carried = {}          # {runner_id: base} after the previous play
+
     for play in all_plays:
         matchup = play.get('matchup', {})
         about = play.get('about', {})
+
+        # Runners on base when this play starts: whoever the previous play of the
+        # same half inning left on. Runner movements inside the play (steals, wild
+        # pitches, the extra-inning placed runner) are applied event by event below.
+        this_half = (about.get('inning'), about.get('halfInning'))
+        pos = dict(carried) if this_half == prev_half else {}
+        prev_half = this_half
+        carried = _post_play_bases(play)
+        moves_by_event = _runner_moves(play)
+        # Count before the next pitch, tracked through every play event (pitches,
+        # automatic balls/strikes, ...) rather than backed out of the post-pitch count.
+        pre_balls, pre_strikes = 0, 0
 
         batter = matchup.get('batter', {})
         pitcher = matchup.get('pitcher', {})
@@ -150,7 +203,21 @@ def get_pitch_data(game_id):
         result = play.get('result', {})
         events = result.get('eventType', '')
 
-        for event in play.get('playEvents', []):
+        for ev_index, event in enumerate(play.get('playEvents', [])):
+            # State BEFORE this event, then advance the trackers for the next one.
+            on_1b = '1B' in pos.values()
+            on_2b = '2B' in pos.values()
+            on_3b = '3B' in pos.values()
+            balls, strikes = pre_balls, pre_strikes
+            try:
+                _apply_moves(pos, moves_by_event.get(event.get('index', ev_index), []))
+            except Exception:
+                pass
+            ev_count = event.get('count') or {}
+            if ev_count.get('balls') is not None and ev_count.get('strikes') is not None:
+                pre_balls = min(int(ev_count['balls']), 3)
+                pre_strikes = min(int(ev_count['strikes']), 2)
+
             if not event.get('isPitch', False):
                 continue
 
@@ -168,18 +235,11 @@ def get_pitch_data(game_id):
             pitch_type_code = pitch_type_obj.get('code', '')
             pitch_name = pitch_type_obj.get('description', '')
 
-            # Pre-pitch count (back out the post-pitch adjustment)
+            # Pre-pitch count: tracked above. (Backing it out of the post-pitch count
+            # filed every two-strike foul as a one-strike pitch.)
+            # `outs` in the feed is the number of outs when the batter came up.
             count = event.get('count', {}) or {}
-            balls_post = count.get('balls', 0) or 0
-            strikes_post = count.get('strikes', 0) or 0
             outs = count.get('outs', 0) or 0
-
-            balls = balls_post
-            strikes = strikes_post
-            if details.get('isBall', False):
-                balls = max(0, balls - 1)
-            elif details.get('isStrike', False):
-                strikes = max(0, strikes - 1)
 
             count_str = f"{balls}-{strikes}"
 
@@ -253,7 +313,10 @@ def get_pitch_data(game_id):
                 'balls': balls,
                 'strikes': strikes,
                 'count': count_str,
-                'outs': outs,
+                'outs': outs,                 # outs when the batter came up
+                'on_1b': on_1b,               # runner on first before the pitch
+                'on_2b': on_2b,
+                'on_3b': on_3b,
                 'at_bat_number': at_bat_index,
                 'pitch_number': event.get('pitchNumber', 0),
 
