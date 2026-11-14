@@ -21,6 +21,7 @@ Outputs:
 """
 
 import json
+import os
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -150,12 +151,18 @@ def get_schedule(date):
     return games
 
 
+# Games whose feed could not be fetched during this run (see main: a day with a failed
+# game never overwrites a daily file that already exists).
+FAILED_FEEDS = set()
+
+
 def get_pitch_data(game_id):
     """Get all pitches from a game with FULL Statcast schema."""
     url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
     data = _get_json(url, timeout=30)
     if data is None:
         print(f"  Feed fetch failed for game {game_id}")
+        FAILED_FEEDS.add(game_id)
         return []
 
     pitches = []
@@ -416,6 +423,20 @@ def main():
     # Tracker file path (used by cleanup + main loop below)
     tracker_file = base_path / 'last_update.json'
 
+    def rewind_tracker():
+        """Forget the last fetched date (so fetching restarts at Opening Day) but keep the other flags."""
+        if not tracker_file.exists():
+            return False
+        try:
+            with open(tracker_file) as f:
+                kept = json.load(f)
+            kept.pop('last_date', None)
+            with open(tracker_file, 'w') as f:
+                json.dump(kept, f)
+        except Exception:
+            tracker_file.unlink()
+        return True
+
     # ── Auto-cleanup: detect daily files written by the OLD broken script ──
     # The old version wrote ~11 columns. The new version writes ~50.
     # Any file with the old schema gets deleted so it'll be re-fetched fresh.
@@ -448,15 +469,6 @@ def main():
                         daily_file.unlink()
                         deleted_count += 1
                         continue
-                    # One-time sign-flip cleanup: delete all files so they get re-fetched
-                    # with corrected HB sign convention. This block can be removed after
-                    # one full re-fetch cycle completes successfully.
-                    SIGN_FIX_DATE = '2026-05-04'  # marker date
-                    sign_fix_marker = base_path / '.sign_fix_applied'
-                    if not sign_fix_marker.exists():
-                        print(f"  [cleanup] Deleting {daily_file.name} - one-time HB sign correction")
-                        daily_file.unlink()
-                        deleted_count += 1
             except Exception as inner_e:
                 print(f"  [cleanup] Could not check pfx values for {daily_file.name}: {inner_e}")
         except Exception as e:
@@ -468,9 +480,8 @@ def main():
                 pass
     if deleted_count > 0:
         print(f"  [cleanup] Removed {deleted_count} stale daily files - they'll be re-fetched")
-        # Reset tracker so we re-fetch from start of season
-        if tracker_file.exists():
-            tracker_file.unlink()
+        # Rewind the tracker so the missing days are re-fetched (days that still have a file are skipped)
+        if rewind_tracker():
             print(f"  [cleanup] Reset tracker - will re-fetch from {REGULAR_SEASON_START}")
 
     # ── Also force re-fetch if Opening Day (March 25-26) parquets are missing ──
@@ -480,8 +491,7 @@ def main():
     missing_opening = [d for d in expected_opening if not (daily_path / f"{d}.parquet").exists()]
     if missing_opening:
         print(f"  [cleanup] Missing Opening Day parquets: {missing_opening} - resetting tracker")
-        if tracker_file.exists():
-            tracker_file.unlink()
+        rewind_tracker()
 
     # Read tracker to determine where to start fetching from
     if tracker_file.exists():
@@ -507,12 +517,30 @@ def main():
     today = datetime.now(CENTRAL_TZ).replace(tzinfo=None)
     current_date = last_date + timedelta(days=1)
 
-    # ── ALSO re-fetch the most recent ~3 days every run ──
+    # ── Every run re-fetches today and the previous 3 days ──
     # Catches games that were "Final" by the time we ran but had partial Statcast
     # measurements that get filled in later. Don't trust a final-game snapshot.
-    refetch_window_start = today - timedelta(days=3)
+    refetch_window_start = (today - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    current_date = min(current_date, refetch_window_start)
 
-    # ── Fetch each day from last_date+1 through today ──
+    # ── Full-season refresh: weekly while games are being played, or on request ──
+    # MLB revises older games too (pitch types get reclassified weeks later), so the
+    # whole season is re-fetched once a week instead of on every run. FULL_REFRESH=1
+    # (the "full_refresh" box on the workflow's Run button) forces one now.
+    # Existing daily files are only ever replaced by a complete re-fetch of that day.
+    existing_days = sorted(f.stem for f in daily_path.glob('*.parquet'))
+    season_active = bool(existing_days) and (today - datetime.strptime(existing_days[-1], '%Y-%m-%d')).days <= 21
+    last_full = tracker.get('last_full_refresh')
+    days_since_full = (today - datetime.strptime(last_full, '%Y-%m-%d')).days if last_full else None
+    full_refresh = os.environ.get('FULL_REFRESH', '').strip().lower() in ('1', 'true', 'yes')
+    if not full_refresh and season_active and (days_since_full is None or days_since_full >= 7):
+        full_refresh = True
+    if full_refresh:
+        print("Full-season refresh this run")
+        current_date = datetime.strptime(REGULAR_SEASON_START, '%Y-%m-%d')
+    refresh_complete = True
+
+    # ── Fetch each day from the start date through today ──
     while current_date <= today:
         date_str = current_date.strftime('%Y-%m-%d')
 
@@ -525,20 +553,27 @@ def main():
         is_recent = current_date >= refetch_window_start
 
         # Skip only if the file exists AND is older than the recent window
-        if daily_file.exists() and not is_today and not is_recent:
+        if daily_file.exists() and not is_today and not is_recent and not full_refresh:
             print(f"Skipping {date_str} (already have, outside refetch window)")
             current_date += timedelta(days=1)
             continue
 
         print(f"Fetching games for {date_str}...")
         day_pitches = []
+        failed_before = len(FAILED_FEEDS)
         game_ids = get_schedule(date_str)
         for game_id in game_ids:
             pitches = get_pitch_data(game_id)
             day_pitches.extend(pitches)
             print(f"  Game {game_id}: {len(pitches)} pitches")
+        day_failed = len(FAILED_FEEDS) > failed_before
 
-        if day_pitches:
+        if day_failed and daily_file.exists():
+            # A game's feed could not be fetched: keep the file we already have rather
+            # than replace it with a day that is missing a game.
+            print(f"  Kept existing {daily_file.name} (a game feed failed this run)")
+            refresh_complete = False
+        elif day_pitches:
             pq.write_table(pa.Table.from_pylist(day_pitches), daily_file)
             print(f"  Wrote {len(day_pitches)} pitches to {daily_file}")
         elif is_today:
@@ -547,6 +582,9 @@ def main():
             print(f"  No games found for {date_str}")
 
         current_date += timedelta(days=1)
+
+    # Stamp the weekly refresh only when every day came back whole; otherwise the next run retries.
+    last_full_refresh = today.strftime('%Y-%m-%d') if (full_refresh and refresh_complete) else last_full
 
     # ── A postponed game stays on the schedule of its original date, so its pitches
     # land in two daily files: the original date and the date it was played. Find the
@@ -628,7 +666,8 @@ def main():
             json.dump({
                 'last_date': yesterday.strftime('%Y-%m-%d'),
                 'last_run': datetime.now(CENTRAL_TZ).isoformat(),
-                'postseason_backfill_done': True
+                'postseason_backfill_done': True,
+                'last_full_refresh': last_full_refresh
             }, f)
         return
 
@@ -740,7 +779,8 @@ def main():
         json.dump({
             'last_date': yesterday.strftime('%Y-%m-%d'),
             'last_run': datetime.now(CENTRAL_TZ).isoformat(),
-            'postseason_backfill_done': True
+            'postseason_backfill_done': True,
+            'last_full_refresh': last_full_refresh
         }, f)
 
 

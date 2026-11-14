@@ -5,6 +5,12 @@ on:
     # Run every 30 minutes
     - cron: '*/30 * * * *'
   workflow_dispatch:  # Allow manual trigger
+    inputs:
+      full_refresh:
+        description: "Re-fetch the whole season (otherwise: the last 3 days, plus a weekly full refresh)"
+        required: false
+        type: boolean
+        default: false
 
 # Never let two runs overlap: a second trigger waits for the first to finish.
 # Without this, overlapping runs can race each other's pushes.
@@ -29,6 +35,8 @@ jobs:
       run: pip install -r requirements.txt
 
     - name: Run pitch data fetcher
+      env:
+        FULL_REFRESH: ${{ inputs.full_refresh && '1' || '' }}
       run: python src/fetch_pitches.py
 
     - name: Configure git
